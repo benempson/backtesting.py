@@ -12,6 +12,7 @@ import sys
 import warnings
 from abc import ABCMeta, abstractmethod
 from copy import copy
+from difflib import get_close_matches
 from functools import lru_cache, partial
 from itertools import chain, product, repeat
 from math import copysign
@@ -64,10 +65,12 @@ class Strategy(metaclass=ABCMeta):
     def _check_params(self, params):
         for k, v in params.items():
             if not hasattr(self, k):
+                suggestions = get_close_matches(k, (attr for attr in dir(self) if not attr.startswith('_')))
+                hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
                 raise AttributeError(
-                    f"Strategy '{self.__class__.__name__}' is missing parameter '{k}'."
+                    f"Strategy '{self.__class__.__name__}' is missing parameter '{k}'. "
                     "Strategy class should define parameters as class variables before they "
-                    "can be optimized or run with.")
+                    "can be optimized or run with." + hint)
             setattr(self, k, v)
         return params
 
@@ -964,8 +967,9 @@ class _Broker:
                 # Not enough cash/margin even for a single unit
                 if not size:
                     warnings.warn(
-                        f'time={self._i}: Broker canceled the relative-sized '
-                        f'order due to insufficient margin.', category=UserWarning)
+                        f'time={self._i}: Broker canceled the relative-sized order due to insufficient margin '
+                        f'(equity={self.equity:.2f}, margin_available={self.margin_available:.2f}).',
+                        category=UserWarning)
                     # XXX: The order is canceled by the broker?
                     self.orders.remove(order)
                     continue
@@ -998,6 +1002,10 @@ class _Broker:
             # If we don't have enough liquidity to cover for the order, the broker CANCELS it
             if abs(need_size) * adjusted_price_plus_commission > \
                     self.margin_available * self._leverage:
+                warnings.warn(
+                    f'time={self._i}: Broker canceled the order due to insufficient margin '
+                    f'(equity={self.equity:.2f}, margin_available={self.margin_available:.2f}).',
+                    category=UserWarning)
                 self.orders.remove(order)
                 continue
 
@@ -1121,7 +1129,7 @@ class Backtest:
 
     `cash` is the initial cash to start with.
 
-    `spread` is the the constant bid-ask spread rate (relative to the price).
+    `spread` is the constant bid-ask spread rate (relative to the price).
     E.g. set it to `0.0002` for commission-less forex
     trading where the average spread is roughly 0.2‰ of the asking price.
 
@@ -1151,7 +1159,7 @@ class Backtest:
 
     `margin` is the required margin (ratio) of a leveraged account.
     No difference is made between initial and maintenance margins.
-    To run the backtest using e.g. 50:1 leverge that your broker allows,
+    To run the backtest using e.g. 50:1 leverage that your broker allows,
     set margin to `0.02` (1 / leverage).
 
     If `trade_on_close` is `True`, market orders will be filled
