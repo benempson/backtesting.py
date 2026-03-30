@@ -1,3 +1,7 @@
+/.claude/commands
+/.claude/logs
+/.claude/rules
+
 *.py[cod]
 *.html
 *.png
