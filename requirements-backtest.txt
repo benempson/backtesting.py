@@ -1,0 +1,4 @@
+python-dotenv
+pyarrow
+yfinance
+ib_async

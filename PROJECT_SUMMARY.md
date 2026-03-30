@@ -87,6 +87,19 @@ backtesting.py/
 ├── .github/workflows/
 │   ├── ci.yml               # Lint → coverage → build → docs → win64
 │   └── deploy-docs.yml      # Documentation deployment
+├── data_vault/
+│   ├── __init__.py          # Package exports: DataVault
+│   ├── data_vault.py        # Core class: config, cache, fetch, normalize
+│   ├── rate_limiter.py      # YFRateLimiter for yfinance rate limiting
+│   └── tests/
+│       └── test_data_vault.py  # 24 tests: config, cache, normalization, rate limiter
+├── docs/
+│   ├── specs/data/
+│   │   └── data-vault-spec.md  # DataVault specification (IMPLEMENTED)
+│   └── refs/data/
+│       └── data-vault-ref.md   # DataVault operational reference
+├── requirements-backtest.txt # DataVault dependencies
+├── .env.example              # DataVault env var template
 ├── AGENTS.md                # AI Architectural Manifesto
 ├── PROJECT_SUMMARY.md       # This file
 ├── README.md                # Quick start & features
