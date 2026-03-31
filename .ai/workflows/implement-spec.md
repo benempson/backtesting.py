@@ -8,8 +8,8 @@ usage: Trigger by typing "/implement-spec"
 ## 1. SELECT & LOCK
 - **Gate:** Has the user specified the spec to work on? If not, ask them to specify it and exit.
 - **Context Lock:** Explicitly output: `Target Spec: docs/specs/[area]/[filename-spec.md]`.
+- **Validate:** If the spec status is DRAFT, move it to APPROVED.
 - **Plan File:** Derive the plan filename: `IMPLEMENTATION_PLAN-{spec-stem}.md` where `{spec-stem}` is the spec's filename without the `-spec.md` suffix.
-- **Validation:** Verify status is `APPROVED`. Review implementation steps.
 - **Context Load:** Follow the protocol in `.ai/workflows/_context-load.md`.
 - **Research Check:** If the spec contains a `## Research Summary` section (from `/draft-spec`), read it. Use the Recommended Approach and Constraints Discovered to inform plan generation in Step 2.
 - **Constraint:** If the spec is ambiguous or lacks detail for a production-ready implementation, **STOP** and ask for clarification.
