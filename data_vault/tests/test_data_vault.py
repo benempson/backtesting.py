@@ -219,15 +219,33 @@ class TestNormalization(unittest.TestCase):
         from data_vault.data_vault import DataVault
         self.assertIsNone(DataVault._normalize(pd.DataFrame()))
 
-    def test_tz_aware_index_stripped(self):
-        """Timezone-aware index is converted to tz-naive (yfinance returns tz-aware)."""
+    def test_tz_aware_index_preserved_in_normalize(self):
+        """Timezone-aware index is preserved through normalization (for cache fidelity)."""
         from data_vault.data_vault import DataVault
         df = _make_ohlcv_df(10)
         df.index = df.index.tz_localize("America/New_York")
 
         result = DataVault._normalize(df)
+        self.assertIsNotNone(result.index.tz)
+        self.assertEqual(str(result.index.tz), "America/New_York")
+
+    def test_strip_tz_removes_timezone(self):
+        """_strip_tz produces a tz-naive DataFrame."""
+        from data_vault.data_vault import DataVault
+        df = _make_ohlcv_df(10)
+        df.index = df.index.tz_localize("America/New_York")
+
+        result = DataVault._strip_tz(df)
         self.assertIsNone(result.index.tz)
         self.assertIsInstance(result.index, pd.DatetimeIndex)
+
+    def test_strip_tz_noop_on_naive(self):
+        """_strip_tz is a no-op on tz-naive data."""
+        from data_vault.data_vault import DataVault
+        df = _make_ohlcv_df(10)
+
+        result = DataVault._strip_tz(df)
+        self.assertIsNone(result.index.tz)
 
 
 # ── test: manifest ────────────────────────────────────────────────────────────
