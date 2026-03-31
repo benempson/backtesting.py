@@ -128,6 +128,33 @@ DataVault provides a single `DataVault` class that fetches, caches, and normaliz
 
 ## Out of Scope
 - No changes to `backtesting/` package (core library untouched)
-- No CLI interface (DataVault is used programmatically)
 - No async/concurrent fetching (sequential due to IB pacing and rate limits)
 - No database backend (Parquet + JSON manifest only)
+
+---
+
+## Revision [Date:2026-03-31 00:00] — change-id: add-cli-logging
+
+### Requirements
+
+- [x] **R10: Logging Configuration** — Configure `data_vault` logger with both a `RotatingFileHandler` (max size and backup count from env vars `VAULT_LOG_MAX_BYTES` default `1048576`, `VAULT_LOG_BACKUP_COUNT` default `6`) and a `StreamHandler` (console). Log file at `{VAULT_DIR}/data_vault.log`. Format: `"{asctime} {levelname}|VAULT|{message}"`.
+- [x] **R11: CLI Interface (`__main__.py`)** — Interactive CLI that:
+  1. Presents numbered, alphabetically sorted list of exchanges (NYSE, NASDAQ). Accepts comma/space-separated numbers. Validates and exits on invalid input.
+  2. Presents numbered, alphabetically sorted list of GICS sectors. Accepts comma/space-separated numbers. Validates and exits on invalid input.
+  3. Uses `yfinance.screener` (`EquityQuery` + `screen()`) to fetch tickers for selected sector/exchange combinations. Paginates (max 250/call).
+  4. Fetches OHLCV data for all discovered tickers via `DataVault.get_batch()`. Logs progress: `"Fetching {ticker}: {counter} of {total}"`.
+- [x] **R12: Exchange/Sector Data** — JSON datastore at `data_vault/markets.json` containing exchanges (code + display name) and GICS sectors.
+- [x] **R13: VS Code Debug Config** — `launch.json` entry to run `data_vault` as a module.
+
+### Unhappy Paths
+
+- **Invalid exchange selection (non-numeric, out of range):** Print error, `sys.exit(1)`.
+- **Invalid sector selection:** Same as above.
+- **yfinance screener returns 0 tickers:** Log warning, skip that sector/exchange combo, continue.
+- **yfinance screener API error:** Log warning, skip combo, continue.
+- **Screener results exceed 250 (pagination needed):** Paginate with offset until all tickers collected.
+
+### Technical Plan
+
+- **Files:** `data_vault/__main__.py`, `data_vault/logging_config.py`, `data_vault/markets.json`, `.vscode/launch.json`, `.env.example`
+- **Test Strategy:** Category B for launch.json/.env changes. Category A for CLI logic (screener, input parsing) — add tests to `data_vault/tests/test_data_vault.py`.

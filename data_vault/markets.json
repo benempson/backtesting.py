@@ -1,0 +1,25 @@
+{
+  "exchanges": {
+    "NASDAQ": {
+      "yf_code": "NMS",
+      "display_name": "NASDAQ"
+    },
+    "NYSE": {
+      "yf_code": "NYQ",
+      "display_name": "NYSE"
+    }
+  },
+  "sectors": [
+    "Basic Materials",
+    "Communication Services",
+    "Consumer Cyclical",
+    "Consumer Defensive",
+    "Energy",
+    "Financial Services",
+    "Healthcare",
+    "Industrials",
+    "Real Estate",
+    "Technology",
+    "Utilities"
+  ]
+}
