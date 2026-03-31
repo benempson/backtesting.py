@@ -16,7 +16,7 @@ consolidated report at the end.
 2. Stage only the files that were touched in this session — do not stage files not changed by this session.
 3. Run `git log --oneline -5` to review the project's commit message style, then write a message that matches it. Keep it short and imperative (e.g. "Fix SL order gap handling"). No bullet-point body, no co-author footers.
 4. Commit the staged files.
-5. Ask the user before pushing to remote — do not push automatically.
+5. Push the repo to remote.
 
 ## Phase 2: Remember It
 Review what was learned during the session. Decide where each piece of

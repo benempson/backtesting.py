@@ -1,6 +1,12 @@
-/.claude/commands
-/.claude/logs
-/.claude/rules
+.env
+CLAUDE.md
+
+/.claude/commands/
+/.claude/logs/
+/.claude/rules/
+/.claude/settings.local.json
+
+/data_vault/data/
 
 *.py[cod]
 *.html
