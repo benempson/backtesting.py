@@ -192,12 +192,12 @@ class DataVault:
             )
             return None
 
-        # Save to cache (R5.5).
+        # Save to cache (R5.5) — preserves source timezone.
         self._save_to_cache(ticker, df)
 
-        # Slice to requested years.
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=years)
-        return df.loc[df.index >= cutoff]
+        # Slice to requested years, then strip tz for backtesting.py compatibility.
+        cutoff = self._cutoff_for_index(df.index, years)
+        return self._strip_tz(df.loc[df.index >= cutoff])
 
     def get_batch(
         self, tickers: list[str], years: int | None = None,
@@ -218,6 +218,24 @@ class DataVault:
             if df is not None:
                 results[ticker] = df
         return results
+
+    # ── timezone helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
+        """Strip timezone from DatetimeIndex for backtesting.py compatibility."""
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+            df = df.copy()
+            df.index = df.index.tz_localize(None)
+        return df
+
+    @staticmethod
+    def _cutoff_for_index(index: pd.DatetimeIndex, years: int) -> pd.Timestamp:
+        """Build a cutoff timestamp that is tz-compatible with ``index``."""
+        cutoff = pd.Timestamp.now() - pd.DateOffset(years=years)
+        if index.tz is not None:
+            cutoff = cutoff.tz_localize(index.tz)
+        return cutoff
 
     # ── cache logic ───────────────────────────────────────────────────────────
 
@@ -246,8 +264,8 @@ class DataVault:
             os.remove(parquet_path)
             return None
 
-        # Check if cached range covers the requested years.
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=years)
+        # Build tz-compatible cutoff to match cached data's timezone.
+        cutoff = self._cutoff_for_index(df.index, years)
         data_start = entry.get("data_start_date", "")
         if data_start:
             cached_start = pd.Timestamp(data_start)
@@ -264,7 +282,8 @@ class DataVault:
 
         logger.info("%s: cache hit", ticker)
         sliced = df.loc[df.index >= cutoff]
-        return sliced if not sliced.empty else df
+        result = sliced if not sliced.empty else df
+        return self._strip_tz(result)
 
     def _save_to_cache(self, ticker: str, df: pd.DataFrame) -> None:
         """Save DataFrame to Parquet and update manifest (R5.5)."""
@@ -541,11 +560,9 @@ class DataVault:
         if "Volume" not in df.columns:
             df["Volume"] = float("nan")
 
-        # Ensure DatetimeIndex (tz-naive — backtesting.py expects naive timestamps).
+        # Ensure DatetimeIndex (preserve source timezone for cache fidelity).
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
         df.index.name = None
 
         # Sort ascending.
