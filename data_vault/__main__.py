@@ -125,7 +125,16 @@ def _fetch_tickers(exchanges: list[dict], sectors: list[str]) -> list[str]:
                 display_name, sector,
             )
 
-    tickers = sorted(all_tickers)
+    from .data_vault import is_preferred_share
+    preferred = {t for t in all_tickers if is_preferred_share(t)}
+    filtered = all_tickers - preferred
+    if preferred:
+        logger.info(
+            "Filtered %d preferred share tickers (e.g. %s)",
+            len(preferred), ", ".join(sorted(preferred)[:5]),
+        )
+
+    tickers = sorted(filtered)
     logger.info("Total unique tickers discovered: %d", len(tickers))
     return tickers
 
@@ -164,6 +173,9 @@ def main() -> None:
     # Fetch OHLCV data via DataVault.
     from .data_vault import DataVault
     vault = DataVault()
+
+    # Prune any previously cached preferred share data.
+    vault.prune_preferred_shares()
 
     total = len(tickers)
     logger.info("Starting OHLCV fetch for %d tickers...", total)

@@ -14,12 +14,12 @@ from logging.handlers import RotatingFileHandler
 
 def setup_logging() -> None:
     """Configure the ``data_vault`` logger with file + console handlers."""
-    vault_dir = os.environ.get("VAULT_DIR", "data_vault/")
+    log_dir = os.environ.get("VAULT_LOG_DIR", "logs/")
     max_bytes = int(os.environ.get("VAULT_LOG_MAX_BYTES", 1_048_576))
     backup_count = int(os.environ.get("VAULT_LOG_BACKUP_COUNT", 6))
-    log_file = os.path.join(vault_dir, "data_vault.log")
+    log_file = os.path.join(log_dir, "data_vault.log")
 
-    os.makedirs(vault_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     logger = logging.getLogger("data_vault")
     logger.setLevel(logging.DEBUG)

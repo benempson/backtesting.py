@@ -58,6 +58,15 @@ _AV_DAILY_LIMIT = 25
 import re
 _VALID_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,19}$")
 
+# Preferred share suffixes: -P, -PA through -PZ (e.g. AGM-PD, ALL-PB).
+# Single-letter suffixes like -A, -B are common share classes (e.g. BRK-B) and kept.
+_PREFERRED_TICKER_RE = re.compile(r"-P[A-Z]?$")
+
+
+def is_preferred_share(ticker: str) -> bool:
+    """Return True if ``ticker`` looks like a preferred share class."""
+    return bool(_PREFERRED_TICKER_RE.search(ticker.upper()))
+
 
 # ── throttle exception ──────────────────────────────────────────────────────
 
@@ -229,6 +238,47 @@ class DataVault:
         # Slice to requested years, then strip tz for backtesting.py compatibility.
         cutoff = self._cutoff_for_index(df.index, years)
         return self._strip_tz(df.loc[df.index >= cutoff])
+
+    def prune_preferred_shares(self) -> list[str]:
+        """Remove cached data for preferred share tickers.
+
+        Deletes Parquet files and manifest entries for tickers matching
+        the preferred share pattern (e.g. ``AGM-PD``, ``ALL-PB``).
+
+        Returns:
+            List of pruned ticker symbols.
+        """
+        pruned: list[str] = []
+
+        # Scan manifest for preferred tickers.
+        preferred_in_manifest = [
+            t for t in list(self._manifest)
+            if not t.startswith("_") and is_preferred_share(t)
+        ]
+        for ticker in preferred_in_manifest:
+            del self._manifest[ticker]
+            pruned.append(ticker)
+
+        # Scan vault directory for orphaned Parquet files.
+        for fname in os.listdir(self._vault_dir):
+            if fname.endswith("_history.parquet"):
+                ticker = fname.replace("_history.parquet", "")
+                if is_preferred_share(ticker) and ticker not in pruned:
+                    pruned.append(ticker)
+                if is_preferred_share(ticker):
+                    parquet_path = os.path.join(self._vault_dir, fname)
+                    os.remove(parquet_path)
+
+        if pruned:
+            self._save_manifest()
+            logger.info(
+                "Pruned %d preferred share tickers from cache: %s",
+                len(pruned), ", ".join(sorted(pruned)),
+            )
+        else:
+            logger.info("No preferred share tickers found in cache")
+
+        return sorted(pruned)
 
     def get_batch(
         self, tickers: list[str], years: int | None = None,

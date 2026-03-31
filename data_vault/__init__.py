@@ -12,6 +12,6 @@ Usage::
     df = vault.get_data("AAPL", years=5)
 """
 
-from .data_vault import DataVault
+from .data_vault import DataVault, is_preferred_share
 
-__all__ = ["DataVault"]
+__all__ = ["DataVault", "is_preferred_share"]
