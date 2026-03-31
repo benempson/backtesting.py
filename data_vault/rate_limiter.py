@@ -33,6 +33,24 @@ _WINDOW_DURATIONS: dict[str, datetime.timedelta] = {
 }
 
 
+# ── exceptions ───────────────────────────────────────────────────────────────
+
+
+class RateLimitPaused(Exception):
+    """Raised when the per-minute limit is hit instead of blocking.
+
+    The caller can catch this to try an alternative source and come back
+    later, rather than sleeping inline.
+
+    Attributes:
+        wait_seconds: Seconds until the minute window resets.
+    """
+
+    def __init__(self, wait_seconds: float) -> None:
+        self.wait_seconds = wait_seconds
+        super().__init__(f"yfinance minute limit, retry in {wait_seconds:.1f}s")
+
+
 # ── main class ────────────────────────────────────────────────────────────────
 
 
@@ -88,17 +106,14 @@ class YFRateLimiter:
                 reset_at = self._state[window]["window_start"] + _WINDOW_DURATIONS[window]
 
                 if window == "minute":
-                    # Per-minute: pause and resume automatically.
+                    # Per-minute: signal throttle to caller (R19).
                     wait_seconds = max(0, (reset_at - now).total_seconds())
                     logger.warning(
-                        "yfinance minute limit reached. "
-                        "Waiting until %s...", reset_at.isoformat(),
+                        "yfinance minute limit reached (%d/%d). "
+                        "Available in %.1fs.",
+                        count, limit, wait_seconds,
                     )
-                    time.sleep(wait_seconds)
-                    # After sleeping, reset the minute window and re-check.
-                    self._state["minute"] = {"count": 0, "window_start": reset_at}
-                    self._save_state()
-                    return self.check_and_increment()
+                    raise RateLimitPaused(wait_seconds)
 
                 # Per-hour / per-day: hard stop.
                 logger.error(

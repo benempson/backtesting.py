@@ -158,3 +158,67 @@ DataVault provides a single `DataVault` class that fetches, caches, and normaliz
 
 - **Files:** `data_vault/__main__.py`, `data_vault/logging_config.py`, `data_vault/markets.json`, `.vscode/launch.json`, `.env.example`
 - **Test Strategy:** Category B for launch.json/.env changes. Category A for CLI logic (screener, input parsing) — add tests to `data_vault/tests/test_data_vault.py`.
+
+---
+
+## Revision [Date:2026-03-31 14:00] — change-id: round-robin-fetch
+
+### Requirements
+
+- [x] **R14: Round-Robin Source Rotation** — Replace the fixed IB → AV → yF waterfall in `_fetch_from_providers` with a round-robin strategy. The `DataVault` instance maintains a rotation index and a list of available sources (`["ib", "alpha_vantage", "yfinance"]`). For each call to `_fetch_from_providers`:
+  1. Pick the source at the current rotation index as the first-try source.
+  2. If the first-try source fails for this ticker, cycle through the remaining available sources.
+  3. Advance the rotation index after each call (regardless of success/failure).
+- [x] **R15: Dynamic Source Exhaustion** — When a source hits its daily limit, remove it from the available sources list for the remainder of the instance's lifetime:
+  - Alpha Vantage: 25 calls/day (existing `_AV_DAILY_LIMIT`). On limit hit, remove `"alpha_vantage"` from available sources and log warning.
+  - yfinance: 48,000 calls/day (existing `YF_LIMIT_PER_DAY`). On limit hit, remove `"yfinance"` from available sources and log warning.
+  - IB: No daily limit. Only removed if connection fails entirely (existing F2 behavior).
+- [x] **R16: Graceful Degradation** — When sources are exhausted:
+  - Two sources remaining: continue rotation with two.
+  - One source remaining (typically IB): fall back to single-source mode with pacing.
+  - Zero sources: existing F3 behavior (warn, skip ticker, return None).
+
+### Unhappy Paths
+
+- **F15 — AV limit reached mid-run:** Remove `"alpha_vantage"` from `_available_sources`, log `"Alpha Vantage daily limit reached (%d/%d), removed from rotation"`, continue with remaining sources.
+- **F16 — yF limit reached mid-run:** Remove `"yfinance"` from `_available_sources`, log `"yfinance daily limit reached, removed from rotation"`, continue with remaining sources.
+- **F17 — Both AV + yF exhausted:** Log `"Only IB remaining in rotation"`, continue IB-only with existing pacing.
+- **F18 — IB unavailable at session start:** Remove `"ib"` from `_available_sources`, rotate between AV + yF.
+- **F19 — All sources unavailable/exhausted:** Existing F3 — warn, skip ticker, return None.
+- **F20 — Source fails for specific ticker (not exhausted):** Try next available source in rotation for same ticker before giving up.
+
+### Technical Plan
+
+- **Files:** `data_vault/data_vault.py` (modify `__init__`, `_fetch_from_providers`, add `_available_sources` and `_rotation_index` attributes)
+- **Validation:** No new env vars needed. Existing `_AV_DAILY_LIMIT` and `YF_LIMIT_PER_DAY` env vars already cover limits.
+- **Test Strategy:** Category A — add round-robin tests to `data_vault/tests/test_data_vault.py`. Key scenarios: rotation order, source exhaustion mid-batch, fallback when source fails, all-sources-exhausted.
+
+---
+
+## Revision [Date:2026-03-31 16:30] — change-id: smart-throttle-retry
+
+### Requirements
+
+- [x] **R17: Source Throttle Signalling** — Introduce a `_SourceThrottled` exception (internal to `data_vault.py`) with `source: str` and `wait_seconds: float`. Fetch methods raise this instead of silently failing when they are temporarily rate-limited (not permanently exhausted).
+- [x] **R18: IB Pacing Modes** — New env var `IB_PACING_ENABLED` (default `true`):
+  - **Enabled:** Track `_last_ib_request_time`. Before each IB fetch, if less than `IB_HISTORY_WAIT_SECONDS` have elapsed, raise `_SourceThrottled("ib", remaining)`. Remove the post-fetch `time.sleep()` — pacing is now handled by the rotation.
+  - **Disabled:** No proactive tracking. Detect IB pacing violation errors (keyword `"pacing"` in exception message) and raise `_SourceThrottled("ib", IB_HISTORY_WAIT_SECONDS)`.
+- [x] **R19: yFinance Throttle Signal** — Modify `YFRateLimiter.check_and_increment()`: on per-minute limit, raise `RateLimitPaused(wait_seconds)` instead of sleeping. Callers catch this and convert to `_SourceThrottled`. Hour/day limits still raise `SystemExit(1)` (handled by existing `_try_fetch_yfinance` wrapper).
+- [x] **R20: Smart Retry in `_fetch_from_providers`** — After cycling through all sources for a ticker:
+  1. If any sources raised `_SourceThrottled`, collect `{source: wait_seconds}`.
+  2. Pick the source with the shortest wait, sleep that duration, retry that one source.
+  3. If the retry also fails or is throttled, give up for this ticker (return None).
+
+### Unhappy Paths
+
+- **F21 — IB pacing violation (reactive mode):** Detect "pacing" in IB error, raise `_SourceThrottled`, try next source. If all throttled, wait shortest and retry.
+- **F22 — IB proactive throttle:** Less than `IB_HISTORY_WAIT_SECONDS` since last IB call, raise `_SourceThrottled` with remaining time. Try next source.
+- **F23 — yF minute limit:** Rate limiter raises `RateLimitPaused`, converted to `_SourceThrottled`. Try next source.
+- **F24 — All sources throttled simultaneously:** Wait for shortest cooldown, retry that source. If still fails, return None for this ticker.
+- **F25 — Throttled source also permanently exhausted on retry:** Treat as failure, return None.
+
+### Technical Plan
+
+- **Files:** `data_vault/data_vault.py`, `data_vault/rate_limiter.py`, `data_vault/tests/test_data_vault.py`, `.env.example`
+- **Validation:** New env var `IB_PACING_ENABLED` with default `true`.
+- **Test Strategy:** Category A — add `TestThrottleRetry` class. Key scenarios: IB proactive throttle, IB reactive throttle, yF minute-limit throttle, all-sources-throttled wait-and-retry, shortest-wait selection.

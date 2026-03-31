@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 try:
     import pandas as pd
@@ -44,6 +45,7 @@ _ENV_DEFAULTS: dict[str, str | None] = {
     "IB_PORT": "4002",
     "IB_HISTORY_WAIT_SECONDS": "15",
     "ALPHA_VANTAGE_API_KEY": None,  # required, no default
+    "IB_PACING_ENABLED": "true",
     "VAULT_INTERACTIVE": "true",
     "YF_LIMIT_PER_MIN": "100",
     "YF_LIMIT_PER_HOUR": "2000",
@@ -55,6 +57,25 @@ _AV_DAILY_LIMIT = 25
 # Ticker symbols must be alphanumeric (with dots/dashes for classes like BRK.B, BF-B).
 import re
 _VALID_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,19}$")
+
+
+# ── throttle exception ──────────────────────────────────────────────────────
+
+
+class _SourceThrottled(Exception):
+    """Raised when a data source is temporarily rate-limited (not exhausted).
+
+    Carries the source name and the number of seconds until the source
+    is expected to be available again, so the caller can choose to wait
+    or try another source.
+    """
+
+    def __init__(self, source: str, wait_seconds: float) -> None:
+        self.source = source
+        self.wait_seconds = wait_seconds
+        super().__init__(
+            f"{source} throttled, available in {wait_seconds:.1f}s"
+        )
 
 
 # ── main class ────────────────────────────────────────────────────────────────
@@ -100,6 +121,9 @@ class DataVault:
         self._ib_port: int = int(os.environ.get("IB_PORT", "7497"))
         self._ib_wait: int = int(os.environ.get("IB_HISTORY_WAIT_SECONDS", "15"))
         self._av_key: str = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+        self._ib_pacing_enabled: bool = os.environ.get(
+            "IB_PACING_ENABLED", "true"
+        ).lower() != "false"
 
         # Interactive mode: constructor arg > env var > default True.
         if interactive is not None:
@@ -125,6 +149,13 @@ class DataVault:
         self._yf_limiter = YFRateLimiter(
             counter_file=os.path.join(self._vault_dir, "yf_rate_counters.json")
         )
+
+        # Round-robin rotation state (R14/R15/R16).
+        self._available_sources: list[str] = ["ib", "alpha_vantage", "yfinance"]
+        self._rotation_index: int = 0
+        self._ib_unavailable: bool = False
+        self._yf_exhausted: bool = False
+        self._last_ib_request_time: float | None = None
 
         logger.info(
             "DataVault initialised (vault_dir=%s, ttl=%dd, fetch=%dy)",
@@ -269,10 +300,14 @@ class DataVault:
         data_start = entry.get("data_start_date", "")
         if data_start:
             cached_start = pd.Timestamp(data_start)
+            # Match tz-awareness of cutoff (manifest dates are tz-naive strings).
+            if cutoff.tz is not None and cached_start.tz is None:
+                cached_start = cached_start.tz_localize(cutoff.tz)
             if cached_start > cutoff:
                 # Cache is valid but insufficient — need to re-fetch.
                 # Unless this is a short-history ticker (F10/R5.6).
-                actual_years = (pd.Timestamp.now() - cached_start).days / 365.25
+                now = pd.Timestamp.now(tz=cached_start.tz) if cached_start.tz else pd.Timestamp.now()
+                actual_years = (now - cached_start).days / 365.25
                 if actual_years < years - 0.5:
                     # Short-history: accept what we have if cache is fresh.
                     logger.info(
@@ -371,60 +406,154 @@ class DataVault:
 
     # ── data providers ────────────────────────────────────────────────────────
 
+    def _dispatch_fetch(self, source: str, ticker: str) -> pd.DataFrame | None:
+        """Resolve and call the fetch method for a given source name."""
+        if source == "ib":
+            return self._fetch_ib(ticker)
+        if source == "alpha_vantage":
+            return self._fetch_alpha_vantage(ticker)
+        if source == "yfinance":
+            return self._try_fetch_yfinance(ticker)
+        return None
+
     def _fetch_from_providers(self, ticker: str) -> pd.DataFrame | None:
-        """Try IB -> Alpha Vantage -> yfinance. Return DataFrame or None."""
-        source = "unknown"
+        """Try sources in round-robin order (R14). Return DataFrame or None."""
+        if not self._available_sources:
+            logger.error("No data sources available (F19)")
+            return None
 
-        # 1. IB (primary).
-        df = self._fetch_ib(ticker)
-        if df is not None and not df.empty:
-            source = "ib"
-            self._manifest.setdefault(ticker, {})["source"] = source
-            return df
+        # Pre-check: remove AV if daily limit already reached (F15).
+        if (self._av_calls_today >= _AV_DAILY_LIMIT
+                and "alpha_vantage" in self._available_sources):
+            self._available_sources.remove("alpha_vantage")
+            logger.warning(
+                "Alpha Vantage daily limit reached (%d/%d), removed from rotation",
+                self._av_calls_today, _AV_DAILY_LIMIT,
+            )
+            if not self._available_sources:
+                logger.error("No data sources available (F19)")
+                return None
 
-        # 2. Alpha Vantage (secondary).
-        df = self._fetch_alpha_vantage(ticker)
-        if df is not None and not df.empty:
-            source = "alpha_vantage"
-            self._manifest.setdefault(ticker, {})["source"] = source
-            return df
+        # Determine rotation start for this call.
+        start_idx = self._rotation_index % len(self._available_sources)
+        self._rotation_index += 1
 
-        # 3. yfinance (tertiary).
-        df = self._fetch_yfinance(ticker)
-        if df is not None and not df.empty:
-            source = "yfinance"
-            self._manifest.setdefault(ticker, {})["source"] = source
-            return df
+        # Build ordered list: start at rotation index, wrap around.
+        n = len(self._available_sources)
+        ordered = [self._available_sources[(start_idx + i) % n] for i in range(n)]
+
+        throttled: dict[str, float] = {}
+
+        for source in ordered:
+            try:
+                df = self._dispatch_fetch(source, ticker)
+            except _SourceThrottled as exc:
+                throttled[exc.source] = exc.wait_seconds
+                logger.info(
+                    "%s: %s throttled (%.1fs), trying next source",
+                    ticker, exc.source, exc.wait_seconds,
+                )
+                continue
+
+            if df is not None and not df.empty:
+                self._manifest.setdefault(ticker, {})["source"] = source
+                return df
+
+            # Post-fetch: check if AV just hit its limit (F15).
+            if (source == "alpha_vantage"
+                    and self._av_calls_today >= _AV_DAILY_LIMIT
+                    and "alpha_vantage" in self._available_sources):
+                self._available_sources.remove("alpha_vantage")
+                logger.warning(
+                    "Alpha Vantage daily limit reached (%d/%d), "
+                    "removed from rotation",
+                    self._av_calls_today, _AV_DAILY_LIMIT,
+                )
+
+        # Smart retry: if any source was throttled, wait for the shortest
+        # cooldown and retry that one source (R20/F24).
+        if throttled:
+            best_source = min(throttled, key=lambda s: throttled[s])
+            wait = throttled[best_source]
+            logger.info(
+                "%s: all sources busy/failed, waiting %.1fs for %s",
+                ticker, wait, best_source,
+            )
+            time.sleep(wait)
+            try:
+                df = self._dispatch_fetch(best_source, ticker)
+            except _SourceThrottled:
+                return None
+            if df is not None and not df.empty:
+                self._manifest.setdefault(ticker, {})["source"] = best_source
+                return df
 
         return None
 
+    def _try_fetch_yfinance(self, ticker: str) -> pd.DataFrame | None:
+        """Wrapper around _fetch_yfinance that handles rate-limiter signals.
+
+        - ``RateLimitPaused`` (minute limit): converted to ``_SourceThrottled``
+          so the caller can try another source and come back later (F23/R19).
+        - ``SystemExit`` (hour/day limit): catches and removes yfinance from
+          rotation permanently (F16).
+        """
+        from .rate_limiter import RateLimitPaused
+        try:
+            return self._fetch_yfinance(ticker)
+        except RateLimitPaused as exc:
+            raise _SourceThrottled("yfinance", exc.wait_seconds)
+        except SystemExit:
+            self._yf_exhausted = True
+            if "yfinance" in self._available_sources:
+                self._available_sources.remove("yfinance")
+            logger.warning("yfinance daily limit reached, removed from rotation")
+            return None
+
     def _fetch_ib(self, ticker: str) -> pd.DataFrame | None:
-        """Fetch daily bars from Interactive Brokers (R5.2)."""
-        import time
+        """Fetch daily bars from Interactive Brokers (R5.2/R18).
+
+        Raises:
+            _SourceThrottled: When proactive pacing is enabled and not enough
+                time has elapsed since the last IB request, or when a pacing
+                violation error is detected in reactive mode.
+        """
+        # Proactive pacing check (R18 — enabled mode).
+        if self._ib_pacing_enabled and self._last_ib_request_time is not None:
+            elapsed = time.monotonic() - self._last_ib_request_time
+            remaining = self._ib_wait - elapsed
+            if remaining > 0:
+                raise _SourceThrottled("ib", remaining)
 
         ib = IB()
         try:
             ib.connect(self._ib_host, self._ib_port, clientId=0, timeout=10)
         except Exception:
-            if self._interactive:
-                logger.warning(
-                    "IB connection failed at %s:%s. "
-                    "Continue with fallback providers? (y/n)",
-                    self._ib_host, self._ib_port,
-                )
-                try:
-                    answer = input(
-                        f"IB connection failed at {self._ib_host}:{self._ib_port}. "
-                        f"Continue with fallback providers? (y/n): "
-                    ).strip().lower()
-                except EOFError:
-                    answer = "y"
-                if answer != "y":
-                    sys.exit(1)
-            else:
-                logger.warning(
-                    "IB unavailable, falling back to Alpha Vantage"
-                )
+            # Mark IB as unavailable and remove from rotation (F18).
+            if not self._ib_unavailable:
+                self._ib_unavailable = True
+                if "ib" in self._available_sources:
+                    self._available_sources.remove("ib")
+                if self._interactive:
+                    logger.warning(
+                        "IB connection failed at %s:%s. "
+                        "Removed from rotation, continuing with other sources.",
+                        self._ib_host, self._ib_port,
+                    )
+                    try:
+                        answer = input(
+                            f"IB connection failed at {self._ib_host}:"
+                            f"{self._ib_port}. "
+                            f"Continue with fallback providers? (y/n): "
+                        ).strip().lower()
+                    except EOFError:
+                        answer = "y"
+                    if answer != "y":
+                        sys.exit(1)
+                else:
+                    logger.warning(
+                        "IB unavailable, removed from rotation"
+                    )
             return None
 
         try:
@@ -445,11 +574,21 @@ class DataVault:
                 return None
 
             df = ib_util.df(bars)
-            time.sleep(self._ib_wait)
+            # Record request time for proactive pacing (no inline sleep).
+            self._last_ib_request_time = time.monotonic()
             logger.info("%s: fetched %d bars from IB", ticker, len(df))
             return df
 
         except Exception as exc:
+            err_msg = str(exc).lower()
+            # Reactive pacing: detect IB pacing violation (F21/R18).
+            if "pacing" in err_msg:
+                logger.warning(
+                    "%s: IB pacing violation, throttled for %ds",
+                    ticker, self._ib_wait,
+                )
+                self._last_ib_request_time = time.monotonic()
+                raise _SourceThrottled("ib", float(self._ib_wait))
             logger.warning("%s: IB fetch error: %s", ticker, exc)
             return None
         finally:

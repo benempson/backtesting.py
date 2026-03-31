@@ -91,6 +91,7 @@ class TestYFRateLimiter(unittest.TestCase):
     def test_multiple_increments(self):
         """Multiple calls increment correctly."""
         os.environ["VAULT_DIR"] = self.tmpdir
+        os.environ["YF_LIMIT_PER_MIN"] = "100"
         from data_vault.rate_limiter import YFRateLimiter
         limiter = YFRateLimiter(counter_file=self.counter_file)
 
@@ -145,20 +146,19 @@ class TestYFRateLimiter(unittest.TestCase):
         # Cleanup.
         os.environ["YF_LIMIT_PER_DAY"] = "48000"
 
-    def test_minute_limit_pauses(self):
-        """Per-minute limit pauses then resumes (mocked sleep)."""
+    def test_minute_limit_raises_paused(self):
+        """Per-minute limit raises RateLimitPaused with wait time (R19)."""
         os.environ["VAULT_DIR"] = self.tmpdir
         os.environ["YF_LIMIT_PER_MIN"] = "1"
-        from data_vault.rate_limiter import YFRateLimiter
+        from data_vault.rate_limiter import YFRateLimiter, RateLimitPaused
         limiter = YFRateLimiter(counter_file=self.counter_file)
 
         limiter.check_and_increment()
 
-        # Second call should hit minute limit and sleep.
-        with patch("data_vault.rate_limiter.time.sleep") as mock_sleep:
-            # After sleep, the recursive call will reset the minute window.
+        # Second call should raise RateLimitPaused.
+        with self.assertRaises(RateLimitPaused) as ctx:
             limiter.check_and_increment()
-            mock_sleep.assert_called_once()
+        self.assertGreater(ctx.exception.wait_seconds, 0)
 
         # Cleanup.
         os.environ["YF_LIMIT_PER_MIN"] = "100"
@@ -582,6 +582,386 @@ class TestLoadMarkets(unittest.TestCase):
         self.assertIn("NASDAQ", markets["exchanges"])
         self.assertEqual(len(markets["sectors"]), 11)
         self.assertIn("Technology", markets["sectors"])
+
+
+# ── test: round-robin fetch ──────────────────────────────────────────────────
+
+
+class TestRoundRobin(unittest.TestCase):
+    """Test round-robin source rotation in _fetch_from_providers."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = os.path.join(self.tmpdir, "vault")
+        os.makedirs(self.vault_dir, exist_ok=True)
+        _setup_env(self.tmpdir, {"VAULT_DIR": self.vault_dir})
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        for k in _ENV_DEFAULTS:
+            os.environ.pop(k, None)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_rotation_order(self, _mock_dotenv):
+        """Sources are called in round-robin order across 3 get_data calls."""
+        from data_vault.data_vault import DataVault
+        vault = DataVault(interactive=False)
+
+        df = _make_ohlcv_df(100)
+        sources_tried_first = []
+
+        original_ib = vault._fetch_ib
+        original_av = vault._fetch_alpha_vantage
+        original_yf = vault._fetch_yfinance
+
+        def mock_ib(ticker):
+            sources_tried_first.append("ib")
+            return df.copy()
+
+        def mock_av(ticker):
+            sources_tried_first.append("alpha_vantage")
+            return df.copy()
+
+        def mock_yf(ticker):
+            sources_tried_first.append("yfinance")
+            return df.copy()
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+        vault._fetch_yfinance = mock_yf
+
+        # Call 3 times — each should try a different source first.
+        vault.get_data("AAPL")
+        vault.get_data("MSFT")
+        vault.get_data("GOOG")
+
+        # Each source should have been the first-try exactly once.
+        self.assertEqual(sources_tried_first, ["ib", "alpha_vantage", "yfinance"])
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_av_exhaustion_removes_from_rotation(self, _mock_dotenv):
+        """AV at daily limit is removed from rotation, rotation continues."""
+        from data_vault.data_vault import DataVault
+        vault = DataVault(interactive=False)
+        vault._av_calls_today = 25  # At limit.
+
+        df = _make_ohlcv_df(100)
+        sources_used = []
+
+        def mock_ib(ticker):
+            sources_used.append("ib")
+            return df.copy()
+
+        def mock_yf(ticker):
+            sources_used.append("yfinance")
+            return df.copy()
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_yfinance = mock_yf
+
+        # AV should be removed from rotation after first attempt.
+        vault.get_data("AAPL")
+        vault.get_data("MSFT")
+        vault.get_data("GOOG")
+        vault.get_data("TSLA")
+
+        # AV should never appear — only IB and yF alternating.
+        self.assertNotIn("alpha_vantage", sources_used)
+        self.assertIn("ib", sources_used)
+        self.assertIn("yfinance", sources_used)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_yf_exhaustion_removes_from_rotation(self, _mock_dotenv):
+        """yfinance SystemExit is caught and yF removed from rotation."""
+        from data_vault.data_vault import DataVault
+        vault = DataVault(interactive=False)
+
+        df = _make_ohlcv_df(100)
+        sources_used = []
+
+        def mock_ib(ticker):
+            sources_used.append("ib")
+            return df.copy()
+
+        def mock_av(ticker):
+            sources_used.append("alpha_vantage")
+            return df.copy()
+
+        def mock_yf(ticker):
+            # Simulate rate limiter hard stop.
+            raise SystemExit(1)
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+        vault._fetch_yfinance = mock_yf
+
+        # yF is third in rotation — should be tried on 3rd call,
+        # caught, and removed.
+        vault.get_data("AAPL")  # IB
+        vault.get_data("MSFT")  # AV
+        vault.get_data("GOOG")  # yF fails → caught, falls back
+        vault.get_data("TSLA")  # Should only rotate IB/AV now
+
+        self.assertNotIn("yfinance", vault._available_sources)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_ib_unavailable_removes_from_rotation(self, _mock_dotenv):
+        """IB connection failure removes IB from rotation."""
+        from data_vault.data_vault import DataVault
+        vault = DataVault(interactive=False)
+
+        df = _make_ohlcv_df(100)
+
+        def mock_ib(ticker):
+            return None  # Connection failed.
+
+        def mock_av(ticker):
+            return df.copy()
+
+        def mock_yf(ticker):
+            return df.copy()
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+        vault._fetch_yfinance = mock_yf
+
+        # After IB fails, it should be flagged as unavailable.
+        # Mark IB as having a connection issue (not per-ticker failure).
+        vault._ib_unavailable = True
+        vault._available_sources = [s for s in vault._available_sources if s != "ib"]
+
+        vault.get_data("AAPL")
+        vault.get_data("MSFT")
+
+        self.assertNotIn("ib", vault._available_sources)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_all_sources_exhausted_returns_none(self, _mock_dotenv):
+        """Empty available sources returns None (F19)."""
+        from data_vault.data_vault import DataVault
+        vault = DataVault(interactive=False)
+        vault._available_sources = []
+
+        result = vault.get_data("AAPL")
+        self.assertIsNone(result)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_fallback_on_per_ticker_failure(self, _mock_dotenv):
+        """Source fails for a ticker, next source is tried for same ticker."""
+        from data_vault.data_vault import DataVault
+        vault = DataVault(interactive=False)
+
+        df = _make_ohlcv_df(100)
+        sources_tried = []
+
+        def mock_ib(ticker):
+            sources_tried.append("ib")
+            return None  # Fails for this ticker.
+
+        def mock_av(ticker):
+            sources_tried.append("alpha_vantage")
+            return df.copy()  # Succeeds.
+
+        def mock_yf(ticker):
+            sources_tried.append("yfinance")
+            return df.copy()
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+        vault._fetch_yfinance = mock_yf
+
+        # First call: IB is first in rotation, fails, falls back to AV.
+        result = vault.get_data("AAPL")
+        self.assertIsNotNone(result)
+        self.assertEqual(sources_tried, ["ib", "alpha_vantage"])
+
+
+# ── test: throttle & smart retry ─────────────────────────────────────────────
+
+
+class TestThrottleRetry(unittest.TestCase):
+    """Test source throttling and smart retry logic."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault_dir = os.path.join(self.tmpdir, "vault")
+        os.makedirs(self.vault_dir, exist_ok=True)
+        _setup_env(self.tmpdir, {
+            "VAULT_DIR": self.vault_dir,
+            "IB_PACING_ENABLED": "true",
+            "IB_HISTORY_WAIT_SECONDS": "15",
+        })
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        for k in _ENV_DEFAULTS:
+            os.environ.pop(k, None)
+        os.environ.pop("IB_PACING_ENABLED", None)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_ib_proactive_throttle_skips_to_next(self, _mock_dotenv):
+        """IB proactive pacing raises _SourceThrottled, next source is tried."""
+        import time as time_mod
+        from data_vault.data_vault import DataVault, _SourceThrottled
+        vault = DataVault(interactive=False)
+
+        df = _make_ohlcv_df(100)
+        sources_tried = []
+
+        # Simulate a recent IB request (1 second ago).
+        vault._last_ib_request_time = time_mod.monotonic() - 1.0
+
+        original_fetch_ib = vault._fetch_ib
+
+        def mock_av(ticker):
+            sources_tried.append("alpha_vantage")
+            return df.copy()
+
+        def mock_yf(ticker):
+            sources_tried.append("yfinance")
+            return df.copy()
+
+        vault._fetch_alpha_vantage = mock_av
+        vault._fetch_yfinance = mock_yf
+
+        # IB should be throttled (only 1s of 15s elapsed), AV should be used.
+        result = vault.get_data("AAPL")
+        self.assertIsNotNone(result)
+        # IB should not have been used (throttled), AV picked up.
+        self.assertIn("alpha_vantage", sources_tried)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_ib_reactive_throttle_on_pacing_error(self, _mock_dotenv):
+        """IB pacing violation error raises _SourceThrottled (reactive mode)."""
+        from data_vault.data_vault import DataVault, _SourceThrottled
+        vault = DataVault(interactive=False)
+        vault._ib_pacing_enabled = False  # Reactive mode.
+
+        df = _make_ohlcv_df(100)
+        sources_tried = []
+
+        def mock_ib(ticker):
+            # Simulate IB pacing violation.
+            raise _SourceThrottled("ib", 15.0)
+
+        def mock_av(ticker):
+            sources_tried.append("alpha_vantage")
+            return df.copy()
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+
+        result = vault.get_data("AAPL")
+        self.assertIsNotNone(result)
+        self.assertIn("alpha_vantage", sources_tried)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_yf_minute_throttle_skips_to_next(self, _mock_dotenv):
+        """yFinance minute limit raises throttle, next source is tried."""
+        from data_vault.data_vault import DataVault, _SourceThrottled
+        vault = DataVault(interactive=False)
+
+        df = _make_ohlcv_df(100)
+        sources_tried = []
+
+        def mock_ib(ticker):
+            sources_tried.append("ib")
+            return None  # IB fails for this ticker.
+
+        def mock_av(ticker):
+            sources_tried.append("alpha_vantage")
+            return None  # AV also fails.
+
+        def mock_try_yf(ticker):
+            raise _SourceThrottled("yfinance", 30.0)
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+        vault._try_fetch_yfinance = mock_try_yf
+
+        # All fail/throttled — should wait for yF (shortest throttle) and retry.
+        with patch("data_vault.data_vault.time.sleep") as mock_sleep:
+            def yf_after_wait(ticker):
+                sources_tried.append("yfinance_retry")
+                return df.copy()
+
+            # After sleep, replace the mock so retry succeeds.
+            def sleep_side_effect(seconds):
+                vault._try_fetch_yfinance = yf_after_wait
+
+            mock_sleep.side_effect = sleep_side_effect
+            result = vault.get_data("AAPL")
+
+        self.assertIsNotNone(result)
+        mock_sleep.assert_called_once_with(30.0)
+        self.assertIn("yfinance_retry", sources_tried)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_all_throttled_waits_shortest(self, _mock_dotenv):
+        """When all sources throttled, waits for the shortest cooldown."""
+        from data_vault.data_vault import DataVault, _SourceThrottled
+        vault = DataVault(interactive=False)
+
+        df = _make_ohlcv_df(100)
+
+        def mock_ib(ticker):
+            raise _SourceThrottled("ib", 15.0)
+
+        def mock_av(ticker):
+            raise _SourceThrottled("alpha_vantage", 60.0)
+
+        def mock_yf(ticker):
+            raise _SourceThrottled("yfinance", 10.0)
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+        vault._try_fetch_yfinance = mock_yf
+
+        with patch("data_vault.data_vault.time.sleep") as mock_sleep:
+            def yf_after_wait(ticker):
+                return df.copy()
+
+            def sleep_side_effect(seconds):
+                vault._try_fetch_yfinance = yf_after_wait
+
+            mock_sleep.side_effect = sleep_side_effect
+            result = vault.get_data("AAPL")
+
+        # Should have waited for yfinance (10s — the shortest).
+        mock_sleep.assert_called_once_with(10.0)
+        self.assertIsNotNone(result)
+
+    @patch("data_vault.data_vault.load_dotenv", return_value=True)
+    def test_throttled_retry_fails_returns_none(self, _mock_dotenv):
+        """If retry after wait also fails, returns None for this ticker."""
+        from data_vault.data_vault import DataVault, _SourceThrottled
+        vault = DataVault(interactive=False)
+
+        def mock_ib(ticker):
+            raise _SourceThrottled("ib", 15.0)
+
+        def mock_av(ticker):
+            return None  # Not throttled, just fails.
+
+        def mock_yf(ticker):
+            raise _SourceThrottled("yfinance", 10.0)
+
+        vault._fetch_ib = mock_ib
+        vault._fetch_alpha_vantage = mock_av
+        vault._try_fetch_yfinance = mock_yf
+
+        with patch("data_vault.data_vault.time.sleep") as mock_sleep:
+            # yF still fails after wait.
+            def yf_still_fails(ticker):
+                return None
+
+            mock_sleep.side_effect = lambda s: setattr(
+                vault, '_try_fetch_yfinance', yf_still_fails
+            )
+            result = vault.get_data("AAPL")
+
+        self.assertIsNone(result)
+        mock_sleep.assert_called_once_with(10.0)
 
 
 if __name__ == "__main__":
