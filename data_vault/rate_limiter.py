@@ -61,7 +61,7 @@ class YFRateLimiter:
         }
 
         logger.info(
-            "INFO|VAULT|YFRateLimiter initialised (limits: min=%d, hr=%d, day=%d)",
+            "YFRateLimiter initialised (limits: min=%d, hr=%d, day=%d)",
             self._limits["minute"], self._limits["hour"], self._limits["day"],
         )
 
@@ -91,7 +91,7 @@ class YFRateLimiter:
                     # Per-minute: pause and resume automatically.
                     wait_seconds = max(0, (reset_at - now).total_seconds())
                     logger.warning(
-                        "WARN|VAULT|yfinance minute limit reached. "
+                        "yfinance minute limit reached. "
                         "Waiting until %s...", reset_at.isoformat(),
                     )
                     time.sleep(wait_seconds)
@@ -102,7 +102,7 @@ class YFRateLimiter:
 
                 # Per-hour / per-day: hard stop.
                 logger.error(
-                    "ERROR|VAULT|yfinance %s limit reached (%d/%d). "
+                    "yfinance %s limit reached (%d/%d). "
                     "Retry after %s.", window, count, limit, reset_at.isoformat(),
                 )
                 sys.exit(1)
@@ -137,7 +137,7 @@ class YFRateLimiter:
             with open(self._counter_file, "r", encoding="utf-8") as fh:
                 raw: dict = json.load(fh)
         except (json.JSONDecodeError, OSError):
-            logger.warning("WARN|VAULT|yf_rate_counters.json corrupt, starting fresh")
+            logger.warning("yf_rate_counters.json corrupt, starting fresh")
             return fresh
 
         state: dict[str, dict] = {}
@@ -174,7 +174,7 @@ class YFRateLimiter:
             os.replace(tmp_path, self._counter_file)
         except OSError as exc:
             logger.warning(
-                "WARN|VAULT|Failed to persist rate counter state: %s", exc,
+                "Failed to persist rate counter state: %s", exc,
             )
 
     @staticmethod

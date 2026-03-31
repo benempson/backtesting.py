@@ -219,6 +219,16 @@ class TestNormalization(unittest.TestCase):
         from data_vault.data_vault import DataVault
         self.assertIsNone(DataVault._normalize(pd.DataFrame()))
 
+    def test_tz_aware_index_stripped(self):
+        """Timezone-aware index is converted to tz-naive (yfinance returns tz-aware)."""
+        from data_vault.data_vault import DataVault
+        df = _make_ohlcv_df(10)
+        df.index = df.index.tz_localize("America/New_York")
+
+        result = DataVault._normalize(df)
+        self.assertIsNone(result.index.tz)
+        self.assertIsInstance(result.index, pd.DatetimeIndex)
+
 
 # ── test: manifest ────────────────────────────────────────────────────────────
 
@@ -481,6 +491,79 @@ class TestBacktestIntegration(unittest.TestCase):
         bt = Backtest(normalized, DummyStrategy, cash=10000)
         stats = bt.run()
         self.assertIsNotNone(stats)
+
+
+# ── test: CLI input parsing ───────────────────────────────────────────────────
+
+
+class TestCLIPrompt(unittest.TestCase):
+    """Test the CLI _prompt_selection helper."""
+
+    def test_valid_single_selection(self):
+        """Single valid number returns the correct option."""
+        from data_vault.__main__ import _prompt_selection
+        options = ["Alpha", "Beta", "Gamma"]
+        with patch("builtins.input", return_value="2"):
+            result = _prompt_selection("Test", options)
+        self.assertEqual(result, ["Beta"])
+
+    def test_valid_comma_separated(self):
+        """Comma-separated numbers return correct options."""
+        from data_vault.__main__ import _prompt_selection
+        options = ["Alpha", "Beta", "Gamma"]
+        with patch("builtins.input", return_value="1, 3"):
+            result = _prompt_selection("Test", options)
+        self.assertEqual(result, ["Alpha", "Gamma"])
+
+    def test_valid_space_separated(self):
+        """Space-separated numbers return correct options."""
+        from data_vault.__main__ import _prompt_selection
+        options = ["Alpha", "Beta", "Gamma"]
+        with patch("builtins.input", return_value="1 2"):
+            result = _prompt_selection("Test", options)
+        self.assertEqual(result, ["Alpha", "Beta"])
+
+    def test_out_of_range_exits(self):
+        """Out-of-range number triggers sys.exit(1)."""
+        from data_vault.__main__ import _prompt_selection
+        options = ["Alpha", "Beta"]
+        with patch("builtins.input", return_value="5"):
+            with self.assertRaises(SystemExit) as ctx:
+                _prompt_selection("Test", options)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_non_numeric_exits(self):
+        """Non-numeric input triggers sys.exit(1)."""
+        from data_vault.__main__ import _prompt_selection
+        options = ["Alpha", "Beta"]
+        with patch("builtins.input", return_value="abc"):
+            with self.assertRaises(SystemExit) as ctx:
+                _prompt_selection("Test", options)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_empty_input_exits(self):
+        """Empty input triggers sys.exit(1)."""
+        from data_vault.__main__ import _prompt_selection
+        options = ["Alpha", "Beta"]
+        with patch("builtins.input", return_value=""):
+            with self.assertRaises(SystemExit) as ctx:
+                _prompt_selection("Test", options)
+            self.assertEqual(ctx.exception.code, 1)
+
+
+class TestLoadMarkets(unittest.TestCase):
+    """Test markets.json loading."""
+
+    def test_load_markets(self):
+        """markets.json loads with expected structure."""
+        from data_vault.__main__ import _load_markets
+        markets = _load_markets()
+        self.assertIn("exchanges", markets)
+        self.assertIn("sectors", markets)
+        self.assertIn("NYSE", markets["exchanges"])
+        self.assertIn("NASDAQ", markets["exchanges"])
+        self.assertEqual(len(markets["sectors"]), 11)
+        self.assertIn("Technology", markets["sectors"])
 
 
 if __name__ == "__main__":

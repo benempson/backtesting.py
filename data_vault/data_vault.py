@@ -23,11 +23,12 @@ try:
     from ib_async import IB, Contract, util as ib_util
 except ImportError as _exc:
     logging.getLogger("data_vault").error(
-        "ERROR|VAULT|Missing dependencies. Please run: pip install -r requirements-backtest.txt"
+        "Missing dependencies. Please run: pip install -r requirements-backtest.txt"
     )
     sys.exit(1)
 
-from data_vault.rate_limiter import YFRateLimiter
+from .logging_config import setup_logging
+from .rate_limiter import YFRateLimiter
 
 logger = logging.getLogger("data_vault")
 
@@ -40,7 +41,7 @@ _ENV_DEFAULTS: dict[str, str | None] = {
     "VAULT_TTL_DAYS": "7",
     "VAULT_FETCH_YEARS": "5",
     "IB_HOST": "127.0.0.1",
-    "IB_PORT": "7497",
+    "IB_PORT": "4002",
     "IB_HISTORY_WAIT_SECONDS": "15",
     "ALPHA_VANTAGE_API_KEY": None,  # required, no default
     "VAULT_INTERACTIVE": "true",
@@ -72,11 +73,12 @@ class DataVault:
         # Load .env file — hard stop if missing.
         if not load_dotenv():
             if not os.path.exists(".env"):
-                logger.error(
-                    "ERROR|VAULT|.env file not found. "
-                    "Copy .env.example to .env and fill in values."
-                )
+                print(".env file not found. "
+                      "Copy .env.example to .env and fill in values.")
                 sys.exit(1)
+
+        # Configure logging now that env vars are loaded.
+        setup_logging()
 
         # Validate required env vars.
         missing = [
@@ -85,7 +87,7 @@ class DataVault:
         ]
         if missing:
             logger.error(
-                "ERROR|VAULT|Missing required env vars: %s. See .env.example.",
+                "Missing required env vars: %s. See .env.example.",
                 ", ".join(missing),
             )
             sys.exit(1)
@@ -110,7 +112,7 @@ class DataVault:
         # Auto-create vault directory.
         if not os.path.exists(self._vault_dir):
             os.makedirs(self._vault_dir, exist_ok=True)
-            logger.info("INFO|VAULT|Created vault directory: %s", self._vault_dir)
+            logger.info("Created vault directory: %s", self._vault_dir)
 
         # Load manifest.
         self._manifest_path: str = os.path.join(self._vault_dir, "manifest.json")
@@ -125,7 +127,7 @@ class DataVault:
         )
 
         logger.info(
-            "INFO|VAULT|DataVault initialised (vault_dir=%s, ttl=%dd, fetch=%dy)",
+            "DataVault initialised (vault_dir=%s, ttl=%dd, fetch=%dy)",
             self._vault_dir, self._ttl_days, self._fetch_years,
         )
 
@@ -144,7 +146,7 @@ class DataVault:
         """
         ticker = ticker.upper().strip()
         if not _VALID_TICKER_RE.match(ticker):
-            logger.warning("WARN|VAULT|%s: invalid ticker symbol, skipping", ticker)
+            logger.warning("%s: invalid ticker symbol, skipping", ticker)
             return None
         if years is None:
             years = self._fetch_years
@@ -155,7 +157,7 @@ class DataVault:
             last_attempt = entry.get("last_failed_attempt", "")
             if last_attempt and not self._is_stale(last_attempt):
                 logger.info(
-                    "INFO|VAULT|%s: skipping (negative cache hit, last attempt %s)",
+                    "%s: skipping (negative cache hit, last attempt %s)",
                     ticker, last_attempt,
                 )
                 return None
@@ -169,7 +171,7 @@ class DataVault:
         df = self._fetch_from_providers(ticker)
         if df is None:
             # All sources failed — record negative hit (F1).
-            logger.warning("WARN|VAULT|%s: all sources failed, caching negative hit", ticker)
+            logger.warning("%s: all sources failed, caching negative hit", ticker)
             self._manifest[ticker] = {
                 "status": "failed",
                 "last_failed_attempt": datetime.date.today().isoformat(),
@@ -186,7 +188,7 @@ class DataVault:
         # Validate no NaN in OHLC (F6).
         if df[["Open", "High", "Low", "Close"]].isna().any().any():
             logger.warning(
-                "WARN|VAULT|%s: fetched data has NaN/missing columns, skipping", ticker,
+                "%s: fetched data has NaN/missing columns, skipping", ticker,
             )
             return None
 
@@ -239,7 +241,7 @@ class DataVault:
             df = pd.read_parquet(parquet_path)
         except Exception:
             logger.warning(
-                "WARN|VAULT|%s: corrupt cache, deleting and re-fetching", ticker,
+                "%s: corrupt cache, deleting and re-fetching", ticker,
             )
             os.remove(parquet_path)
             return None
@@ -256,11 +258,11 @@ class DataVault:
                 if actual_years < years - 0.5:
                     # Short-history: accept what we have if cache is fresh.
                     logger.info(
-                        "INFO|VAULT|%s: received %.1f years (requested %d), "
+                        "%s: received %.1f years (requested %d), "
                         "treating as complete", ticker, actual_years, years,
                     )
 
-        logger.info("INFO|VAULT|%s: cache hit", ticker)
+        logger.info("%s: cache hit", ticker)
         sliced = df.loc[df.index >= cutoff]
         return sliced if not sliced.empty else df
 
@@ -277,7 +279,7 @@ class DataVault:
             "rows": len(df),
         }
         self._save_manifest()
-        logger.info("INFO|VAULT|%s: cached %d rows", ticker, len(df))
+        logger.info("%s: cached %d rows", ticker, len(df))
 
     def _is_stale(self, date_str: str) -> bool:
         """Return True if ``date_str`` is older than ``VAULT_TTL_DAYS``."""
@@ -297,7 +299,7 @@ class DataVault:
             with open(self._manifest_path, "r", encoding="utf-8") as fh:
                 return json.load(fh)
         except (json.JSONDecodeError, OSError):
-            logger.warning("WARN|VAULT|manifest.json corrupt, rebuilding from cached files")
+            logger.warning("manifest.json corrupt, rebuilding from cached files")
             return self._rebuild_manifest()
 
     def _save_manifest(self) -> None:
@@ -325,7 +327,7 @@ class DataVault:
                     }
                 except Exception:
                     logger.warning(
-                        "WARN|VAULT|%s: corrupt cache during rebuild, deleting", ticker,
+                        "%s: corrupt cache during rebuild, deleting", ticker,
                     )
                     os.remove(parquet_path)
         return manifest
@@ -402,7 +404,7 @@ class DataVault:
                     sys.exit(1)
             else:
                 logger.warning(
-                    "WARN|VAULT|IB unavailable, falling back to Alpha Vantage"
+                    "IB unavailable, falling back to Alpha Vantage"
                 )
             return None
 
@@ -425,11 +427,11 @@ class DataVault:
 
             df = ib_util.df(bars)
             time.sleep(self._ib_wait)
-            logger.info("INFO|VAULT|%s: fetched %d bars from IB", ticker, len(df))
+            logger.info("%s: fetched %d bars from IB", ticker, len(df))
             return df
 
         except Exception as exc:
-            logger.warning("WARN|VAULT|%s: IB fetch error: %s", ticker, exc)
+            logger.warning("%s: IB fetch error: %s", ticker, exc)
             return None
         finally:
             ib.disconnect()
@@ -442,7 +444,7 @@ class DataVault:
 
         if self._av_calls_today >= _AV_DAILY_LIMIT:
             logger.warning(
-                "WARN|VAULT|Alpha Vantage daily limit reached, falling back to yfinance"
+                "Alpha Vantage daily limit reached, falling back to yfinance"
             )
             return None
 
@@ -457,13 +459,13 @@ class DataVault:
             with urllib.request.urlopen(url, timeout=30) as resp:
                 data = json.loads(resp.read().decode())
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
-            logger.warning("WARN|VAULT|%s: Alpha Vantage error: %s", ticker, exc)
+            logger.warning("%s: Alpha Vantage error: %s", ticker, exc)
             return None
 
         ts = data.get("Time Series (Daily)")
         if not ts:
             error_msg = data.get("Note") or data.get("Error Message") or "empty response"
-            logger.warning("WARN|VAULT|%s: Alpha Vantage returned: %s", ticker, error_msg)
+            logger.warning("%s: Alpha Vantage returned: %s", ticker, error_msg)
             return None
 
         self._increment_av_counter()
@@ -488,7 +490,7 @@ class DataVault:
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.set_index("Date").sort_index()
         logger.info(
-            "INFO|VAULT|%s: fetched %d rows from Alpha Vantage", ticker, len(df),
+            "%s: fetched %d rows from Alpha Vantage", ticker, len(df),
         )
         return df
 
@@ -503,14 +505,14 @@ class DataVault:
             tk = yf.Ticker(ticker)
             df = tk.history(period=period, auto_adjust=True)
         except Exception as exc:
-            logger.warning("WARN|VAULT|%s: yfinance error: %s", ticker, exc)
+            logger.warning("%s: yfinance error: %s", ticker, exc)
             return None
 
         if df is None or df.empty:
-            logger.warning("WARN|VAULT|%s: yfinance returned empty data", ticker)
+            logger.warning("%s: yfinance returned empty data", ticker)
             return None
 
-        logger.info("INFO|VAULT|%s: fetched %d rows from yfinance", ticker, len(df))
+        logger.info("%s: fetched %d rows from yfinance", ticker, len(df))
         return df
 
     # ── normalization ─────────────────────────────────────────────────────────
@@ -539,9 +541,11 @@ class DataVault:
         if "Volume" not in df.columns:
             df["Volume"] = float("nan")
 
-        # Ensure DatetimeIndex.
+        # Ensure DatetimeIndex (tz-naive — backtesting.py expects naive timestamps).
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
         df.index.name = None
 
         # Sort ascending.

@@ -1,6 +1,6 @@
 # Operational Reference: DataVault
 
-> Generated from `docs/specs/data/data-vault-spec.md` and source code on 2026-03-30.
+> Generated from `docs/specs/data/data-vault-spec.md` and source code on 2026-03-31.
 
 ---
 
@@ -23,6 +23,12 @@
 | `_DEFAULT_LIMIT_PER_DAY` | `48000` | Default yfinance per-day ceiling |
 | `_WINDOW_DURATIONS` | `{minute: 1m, hour: 1h, day: 1d}` | Rolling window durations |
 
+### `data_vault/__main__.py`
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `_YF_SCREENER_PAGE_SIZE` | `250` | Max results per yfinance screener call (Yahoo limit) |
+
 ### Environment Variable Defaults (`_ENV_DEFAULTS`)
 
 | Variable | Default | Required |
@@ -38,6 +44,8 @@
 | `YF_LIMIT_PER_MIN` | `100` | No |
 | `YF_LIMIT_PER_HOUR` | `2000` | No |
 | `YF_LIMIT_PER_DAY` | `48000` | No |
+| `VAULT_LOG_MAX_BYTES` | `1048576` | No |
+| `VAULT_LOG_BACKUP_COUNT` | `6` | No |
 
 ---
 
@@ -88,11 +96,15 @@ User script -> DataVault.get_data("AAPL")
 | File | Purpose |
 |---|---|
 | `data_vault/__init__.py` | Package entry — exports `DataVault` |
+| `data_vault/__main__.py` | Interactive CLI: exchange/sector selection, screener, batch fetch |
 | `data_vault/data_vault.py` | Core class: config loading, cache, 3 provider fetchers, normalization |
 | `data_vault/rate_limiter.py` | `YFRateLimiter`: rolling-window rate limiter for yfinance |
-| `data_vault/tests/test_data_vault.py` | 24 unittest tests across 6 TestCase classes |
+| `data_vault/logging_config.py` | `setup_logging()`: rotating file + console handlers |
+| `data_vault/markets.json` | Exchange codes (NYSE/NASDAQ) and GICS sector list |
+| `data_vault/tests/test_data_vault.py` | 31 unittest tests across 8 TestCase classes |
+| `.vscode/launch.json` | VS Code debug config for `python -m data_vault` |
 
-**Dependencies:** `data_vault.py` imports from `rate_limiter.py`. No reverse dependency. No imports from `backtesting/`.
+**Dependencies:** `data_vault.py` imports from `rate_limiter.py` and `logging_config.py`. `__main__.py` imports from `data_vault.py` and `logging_config.py`. No reverse dependencies. No imports from `backtesting/`.
 
 ---
 
